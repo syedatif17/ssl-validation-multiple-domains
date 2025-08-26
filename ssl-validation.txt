@@ -1,110 +1,76 @@
 #!/usr/bin/env bash
-# Run: bash multi_tls_dns.sh domains.txt output.txt
-# Env knobs:
-#   PORT=443 TIMEOUT_SECS=10 PARALLEL=5 VERBOSE=0 DNS_SERVER="" NSLOOKUP_ONCE=1
+# Run: bash tls_dns_seq.sh domains.txt results.txt
+# Env knobs (optional):
+#   PORT=443 ATTEMPTS=3 VERBOSE=0 SLEEP_BETWEEN=0
 
 set -euo pipefail
 
 DOMAINS_FILE="${1:-domains.txt}"
 OUT_FILE="${2:-scan_$(date +%Y%m%d_%H%M%S).txt}"
+
 PORT="${PORT:-443}"
-TIMEOUT_SECS="${TIMEOUT_SECS:-10}"
-PARALLEL="${PARALLEL:-5}"
-VERBOSE="${VERBOSE:-0}"          # 1 = full s_client, 0 = -brief
-DNS_SERVER="${DNS_SERVER:-}"      # e.g. 1.1.1.1 or 8.8.8.8; empty = system default
-NSLOOKUP_ONCE="${NSLOOKUP_ONCE:-1}" # 1 = run nslookup once; 0 = run before each openssl attempt
+ATTEMPTS="${ATTEMPTS:-3}"      # number of s_client runs per domain
+VERBOSE="${VERBOSE:-0}"        # 0 = use -brief, 1 = full output
+SLEEP_BETWEEN="${SLEEP_BETWEEN:-0}"   # seconds to sleep between attempts
 
 if [[ ! -f "$DOMAINS_FILE" ]]; then
-  echo "Domains file not found: $DOMAINS_FILE" >&2; exit 1
+  echo "Domains file not found: $DOMAINS_FILE" >&2
+  exit 1
 fi
 
-# timeout binary (linux: timeout, mac: gtimeout if coreutils installed)
-TIMEOUT_BIN="timeout"
-if ! command -v timeout >/dev/null 2>&1; then
-  if command -v gtimeout >/dev/null 2>&1; then TIMEOUT_BIN="gtimeout"; else TIMEOUT_BIN=""; fi
-fi
+# s_client flags (add SNI with -servername)
+SCLIENT_FLAGS=( -connect "" -servername "" -showcerts )
+[[ "$VERBOSE" -eq 0 ]] && SCLIENT_FLAGS=( -connect "" -servername "" -brief -showcerts )
 
-# choose s_client flags
-SCLIENT_FLAGS=(-connect "" -servername "" -showcerts)
-[[ "$VERBOSE" -eq 0 ]] && SCLIENT_FLAGS=(-connect "" -servername "" -brief -showcerts)
-
-# Clean, de-dupe (ignore blanks/comments)
-mapfile -t DOMAINS < <(sed -E 's/#.*$//' "$DOMAINS_FILE" | awk 'NF' | sort -u)
+# build domain list: strip comments/blanks, de-dupe, keep original order of first appearance
+declare -A seen
+mapfile -t DOMAINS < <(sed -E 's/#.*$//' "$DOMAINS_FILE" | awk 'NF')
+ORDERED=()
+for d in "${DOMAINS[@]}"; do
+  # normalize whitespace
+  d="$(echo -n "$d" | tr -d '\r' )"
+  [[ -n "${seen[$d]:-}" ]] && continue
+  seen[$d]=1
+  ORDERED+=("$d")
+done
 
 echo "Writing to: $OUT_FILE"
 : > "$OUT_FILE"
 
-run_with_timeout () {
-  # $1.. = command
-  if [[ -n "$TIMEOUT_BIN" ]]; then
-    "$TIMEOUT_BIN" "$TIMEOUT_SECS" "$@" 2>&1
-    return $?
-  else
-    "$@" 2>&1
-    return $?
-  fi
-}
-
-do_nslookup () {
-  local d="$1"
-  echo ">>> nslookup ${d} ${DNS_SERVER:+(server ${DNS_SERVER})}"
-  if command -v nslookup >/dev/null 2>&1; then
-    if [[ -n "$DNS_SERVER" ]]; then
-      run_with_timeout nslookup "$d" "$DNS_SERVER" || echo "[WARN] nslookup failed or timed out."
-    else
-      run_with_timeout nslookup "$d" || echo "[WARN] nslookup failed or timed out."
-    fi
-  elif command -v dig >/dev/null 2>&1; then
-    # fallback to dig if nslookup missing
-    echo "(nslookup not found; using dig)"
-    if [[ -n "$DNS_SERVER" ]]; then
-      run_with_timeout dig @"$DNS_SERVER" +timeout="$TIMEOUT_SECS" +retry=0 "$d" A AAAA || echo "[WARN] dig failed."
-    else
-      run_with_timeout dig +timeout="$TIMEOUT_SECS" +retry=0 "$d" A AAAA || echo "[WARN] dig failed."
-    fi
-  else
-    echo "[ERROR] Neither nslookup nor dig is available on this system."
-  fi
-  echo
-}
-
-scan_domain () {
-  local domain="$1"
+for domain in "${ORDERED[@]}"; do
   {
-    echo "==================== ${domain}:${PORT} ===================="
+    printf '==================== %s:%s ====================\n' "$domain" "$PORT"
     date -u +"Start: %Y-%m-%dT%H:%M:%SZ"
     echo
 
-    # nslookup once up-front (or before each attempt if NSLOOKUP_ONCE=0)
-    if [[ "$NSLOOKUP_ONCE" -eq 1 ]]; then
-      do_nslookup "$domain"
-    fi
-
-    for attempt in 1 2 3; do
-      echo "--- ${domain}:${PORT} | attempt ${attempt} ---"
-      if [[ "$NSLOOKUP_ONCE" -eq 0 ]]; then
-        do_nslookup "$domain"
-      fi
-
-      args=("${SCLIENT_FLAGS[@]}")
+    # --- TLS: openssl s_client (ATTEMPTS times), sequential
+    for (( i=1; i<=ATTEMPTS; i++ )); do
+      printf -- '--- %s:%s | attempt %d ---\n' "$domain" "$PORT" "$i"
+      args=( "${SCLIENT_FLAGS[@]}" )
       args[1]="${domain}:${PORT}"
       args[3]="${domain}"
-
-      run_with_timeout openssl s_client "${args[@]}" </dev/null \
-        || echo "[WARN] ${domain} attempt ${attempt}: openssl failed or timed out (${TIMEOUT_SECS}s)."
+      # stdin closed so it won't wait for keystrokes
+      if ! openssl s_client "${args[@]}" </dev/null; then
+        echo "[WARN] ${domain} attempt ${i}: openssl failed."
+      fi
       echo
+      (( SLEEP_BETWEEN > 0 )) && sleep "$SLEEP_BETWEEN"
     done
 
-    date -u +"End:   %Y-%m-%dT%H:%M:%SZ"
-    echo "================== end ${domain}:${PORT} =================="
+    # --- DNS: nslookup (once per domain), sequential
+    echo ">>> nslookup ${domain}"
+    if command -v nslookup >/dev/null 2>&1; then
+      if ! nslookup "$domain"; then
+        echo "[WARN] nslookup failed."
+      fi
+    else
+      echo "[ERROR] nslookup not found on this system."
+    fi
     echo
-  } >> "$OUT_FILE"
-}
 
-jobs=0
-for d in "${DOMAINS[@]}"; do
-  scan_domain "$d" &
-  (( ++jobs % PARALLEL == 0 )) && wait
+    date -u +"End:   %Y-%m-%dT%H:%M:%SZ"
+    printf '================== end %s:%s ==================\n\n' "$domain" "$PORT"
+  } >> "$OUT_FILE"
 done
-wait
+
 echo "Done."
