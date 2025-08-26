@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# Run: bash multi_sclient.sh domains.txt output.txt
+# Env knobs:
+#   PORT=443 TIMEOUT_SECS=10 PARALLEL=5 VERBOSE=0
+
+set -euo pipefail
+
+DOMAINS_FILE="${1:-domains.txt}"
+OUT_FILE="${2:-ssl_scan_$(date +%Y%m%d_%H%M%S).txt}"
+PORT="${PORT:-443}"
+TIMEOUT_SECS="${TIMEOUT_SECS:-10}"
+PARALLEL="${PARALLEL:-5}"     # how many domains to scan at once
+VERBOSE="${VERBOSE:-0}"       # 1 = full s_client output, 0 = -brief
+
+if [[ ! -f "$DOMAINS_FILE" ]]; then
+  echo "Domains file not found: $DOMAINS_FILE" >&2
+  exit 1
+fi
+
+# pick flags
+SCLIENT_FLAGS=(-connect "" -servername "" -showcerts)
+if [[ "$VERBOSE" -eq 0 ]]; then
+  SCLIENT_FLAGS=(-connect "" -servername "" -brief -showcerts)
+fi
+
+# Use timeout if available; otherwise run without it.
+TIMEOUT_BIN="timeout"
+if ! command -v timeout >/dev/null 2>&1; then
+  # macOS note: `brew install coreutils` then use `gtimeout`
+  if command -v gtimeout >/dev/null 2>&1; then
+    TIMEOUT_BIN="gtimeout"
+  else
+    TIMEOUT_BIN=""   # no timeout available
+  fi
+fi
+
+# Clean, de-dupe, and ignore blanks/comments
+mapfile -t DOMAINS < <(sed -E 's/#.*$//' "$DOMAINS_FILE" | awk 'NF' | sort -u)
+
+echo "Writing to: $OUT_FILE"
+: > "$OUT_FILE"   # truncate/create
+
+jobs=0
+for domain in "${DOMAINS[@]}"; do
+  {
+    {
+      echo "==================== ${domain}:${PORT} ===================="
+      date -u +"Start: %Y-%m-%dT%H:%M:%SZ"
+      echo
+
+      # Do it 3 times for each domain (as requested)
+      for attempt in 1 2 3; do
+        echo "--- ${domain}:${PORT} | attempt ${attempt} ---"
+        # Fill in -connect and -servername slots
+        args=("${SCLIENT_FLAGS[@]}")
+        args[1]="${domain}:${PORT}"
+        args[3]="${domain}"
+
+        if [[ -n "$TIMEOUT_BIN" ]]; then
+          "$TIMEOUT_BIN" "$TIMEOUT_SECS" openssl s_client "${args[@]}" </dev/null 2>&1 \
+            || echo "[WARN] ${domain} attempt ${attempt}: openssl failed or timed out (${TIMEOUT_SECS}s)."
+        else
+          openssl s_client "${args[@]}" </dev/null 2>&1 \
+            || echo "[WARN] ${domain} attempt ${attempt}: openssl failed (no timeout available)."
+        fi
+        echo
+      done
+
+      date -u +"End:   %Y-%m-%dT%H:%M:%SZ"
+      echo "================== end ${domain}:${PORT} =================="
+      echo
+    } >> "$OUT_FILE"
+  } &
+
+  (( ++jobs % PARALLEL == 0 )) && wait
+done
+
+wait
+echo "Done."
