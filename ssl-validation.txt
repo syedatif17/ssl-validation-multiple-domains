@@ -1,79 +1,110 @@
 #!/usr/bin/env bash
-# Run: bash multi_sclient.sh domains.txt output.txt
+# Run: bash multi_tls_dns.sh domains.txt output.txt
 # Env knobs:
-#   PORT=443 TIMEOUT_SECS=10 PARALLEL=5 VERBOSE=0
+#   PORT=443 TIMEOUT_SECS=10 PARALLEL=5 VERBOSE=0 DNS_SERVER="" NSLOOKUP_ONCE=1
 
 set -euo pipefail
 
 DOMAINS_FILE="${1:-domains.txt}"
-OUT_FILE="${2:-ssl_scan_$(date +%Y%m%d_%H%M%S).txt}"
+OUT_FILE="${2:-scan_$(date +%Y%m%d_%H%M%S).txt}"
 PORT="${PORT:-443}"
 TIMEOUT_SECS="${TIMEOUT_SECS:-10}"
-PARALLEL="${PARALLEL:-5}"     # how many domains to scan at once
-VERBOSE="${VERBOSE:-0}"       # 1 = full s_client output, 0 = -brief
+PARALLEL="${PARALLEL:-5}"
+VERBOSE="${VERBOSE:-0}"          # 1 = full s_client, 0 = -brief
+DNS_SERVER="${DNS_SERVER:-}"      # e.g. 1.1.1.1 or 8.8.8.8; empty = system default
+NSLOOKUP_ONCE="${NSLOOKUP_ONCE:-1}" # 1 = run nslookup once; 0 = run before each openssl attempt
 
 if [[ ! -f "$DOMAINS_FILE" ]]; then
-  echo "Domains file not found: $DOMAINS_FILE" >&2
-  exit 1
+  echo "Domains file not found: $DOMAINS_FILE" >&2; exit 1
 fi
 
-# pick flags
-SCLIENT_FLAGS=(-connect "" -servername "" -showcerts)
-if [[ "$VERBOSE" -eq 0 ]]; then
-  SCLIENT_FLAGS=(-connect "" -servername "" -brief -showcerts)
-fi
-
-# Use timeout if available; otherwise run without it.
+# timeout binary (linux: timeout, mac: gtimeout if coreutils installed)
 TIMEOUT_BIN="timeout"
 if ! command -v timeout >/dev/null 2>&1; then
-  # macOS note: `brew install coreutils` then use `gtimeout`
-  if command -v gtimeout >/dev/null 2>&1; then
-    TIMEOUT_BIN="gtimeout"
-  else
-    TIMEOUT_BIN=""   # no timeout available
-  fi
+  if command -v gtimeout >/dev/null 2>&1; then TIMEOUT_BIN="gtimeout"; else TIMEOUT_BIN=""; fi
 fi
 
-# Clean, de-dupe, and ignore blanks/comments
+# choose s_client flags
+SCLIENT_FLAGS=(-connect "" -servername "" -showcerts)
+[[ "$VERBOSE" -eq 0 ]] && SCLIENT_FLAGS=(-connect "" -servername "" -brief -showcerts)
+
+# Clean, de-dupe (ignore blanks/comments)
 mapfile -t DOMAINS < <(sed -E 's/#.*$//' "$DOMAINS_FILE" | awk 'NF' | sort -u)
 
 echo "Writing to: $OUT_FILE"
-: > "$OUT_FILE"   # truncate/create
+: > "$OUT_FILE"
+
+run_with_timeout () {
+  # $1.. = command
+  if [[ -n "$TIMEOUT_BIN" ]]; then
+    "$TIMEOUT_BIN" "$TIMEOUT_SECS" "$@" 2>&1
+    return $?
+  else
+    "$@" 2>&1
+    return $?
+  fi
+}
+
+do_nslookup () {
+  local d="$1"
+  echo ">>> nslookup ${d} ${DNS_SERVER:+(server ${DNS_SERVER})}"
+  if command -v nslookup >/dev/null 2>&1; then
+    if [[ -n "$DNS_SERVER" ]]; then
+      run_with_timeout nslookup "$d" "$DNS_SERVER" || echo "[WARN] nslookup failed or timed out."
+    else
+      run_with_timeout nslookup "$d" || echo "[WARN] nslookup failed or timed out."
+    fi
+  elif command -v dig >/dev/null 2>&1; then
+    # fallback to dig if nslookup missing
+    echo "(nslookup not found; using dig)"
+    if [[ -n "$DNS_SERVER" ]]; then
+      run_with_timeout dig @"$DNS_SERVER" +timeout="$TIMEOUT_SECS" +retry=0 "$d" A AAAA || echo "[WARN] dig failed."
+    else
+      run_with_timeout dig +timeout="$TIMEOUT_SECS" +retry=0 "$d" A AAAA || echo "[WARN] dig failed."
+    fi
+  else
+    echo "[ERROR] Neither nslookup nor dig is available on this system."
+  fi
+  echo
+}
+
+scan_domain () {
+  local domain="$1"
+  {
+    echo "==================== ${domain}:${PORT} ===================="
+    date -u +"Start: %Y-%m-%dT%H:%M:%SZ"
+    echo
+
+    # nslookup once up-front (or before each attempt if NSLOOKUP_ONCE=0)
+    if [[ "$NSLOOKUP_ONCE" -eq 1 ]]; then
+      do_nslookup "$domain"
+    fi
+
+    for attempt in 1 2 3; do
+      echo "--- ${domain}:${PORT} | attempt ${attempt} ---"
+      if [[ "$NSLOOKUP_ONCE" -eq 0 ]]; then
+        do_nslookup "$domain"
+      fi
+
+      args=("${SCLIENT_FLAGS[@]}")
+      args[1]="${domain}:${PORT}"
+      args[3]="${domain}"
+
+      run_with_timeout openssl s_client "${args[@]}" </dev/null \
+        || echo "[WARN] ${domain} attempt ${attempt}: openssl failed or timed out (${TIMEOUT_SECS}s)."
+      echo
+    done
+
+    date -u +"End:   %Y-%m-%dT%H:%M:%SZ"
+    echo "================== end ${domain}:${PORT} =================="
+    echo
+  } >> "$OUT_FILE"
+}
 
 jobs=0
-for domain in "${DOMAINS[@]}"; do
-  {
-    {
-      echo "==================== ${domain}:${PORT} ===================="
-      date -u +"Start: %Y-%m-%dT%H:%M:%SZ"
-      echo
-
-      # Do it 3 times for each domain (as requested)
-      for attempt in 1 2 3; do
-        echo "--- ${domain}:${PORT} | attempt ${attempt} ---"
-        # Fill in -connect and -servername slots
-        args=("${SCLIENT_FLAGS[@]}")
-        args[1]="${domain}:${PORT}"
-        args[3]="${domain}"
-
-        if [[ -n "$TIMEOUT_BIN" ]]; then
-          "$TIMEOUT_BIN" "$TIMEOUT_SECS" openssl s_client "${args[@]}" </dev/null 2>&1 \
-            || echo "[WARN] ${domain} attempt ${attempt}: openssl failed or timed out (${TIMEOUT_SECS}s)."
-        else
-          openssl s_client "${args[@]}" </dev/null 2>&1 \
-            || echo "[WARN] ${domain} attempt ${attempt}: openssl failed (no timeout available)."
-        fi
-        echo
-      done
-
-      date -u +"End:   %Y-%m-%dT%H:%M:%SZ"
-      echo "================== end ${domain}:${PORT} =================="
-      echo
-    } >> "$OUT_FILE"
-  } &
-
+for d in "${DOMAINS[@]}"; do
+  scan_domain "$d" &
   (( ++jobs % PARALLEL == 0 )) && wait
 done
-
 wait
 echo "Done."
